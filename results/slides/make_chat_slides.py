@@ -3,7 +3,7 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = "/home/nangbui/Documents/ArthropodModel"
-OUT = os.path.join(ROOT, "results", "slides")
+OUT = "/home/nangbui/Documents/BeetleID/results/slides"   # chat images come from ArthropodModel (ROOT)
 F = "/usr/share/fonts/truetype/dejavu/"
 font = lambda size, bold=False: ImageFont.truetype(F + ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"), size)
 MONO = ImageFont.truetype(F + "DejaVuSansMono.ttf", 19)
