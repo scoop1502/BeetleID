@@ -1,0 +1,15 @@
+# Installable so other projects can use the beetle model as a plug-in:
+#     pip install -e /path/to/BeetleID --no-deps
+# Dependencies: see environment/requirements.txt (not listed here so installing never swaps PyTorch).
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beetleid"
+version = "1.0.0"
+description = "Beetle identification (SPB, Cleridae, other Coleoptera) from microscope photos"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["beetleid*"]

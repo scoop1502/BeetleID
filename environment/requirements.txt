@@ -1,0 +1,22 @@
+# Python 3.10 environment for running the pipeline, apps and detector training
+# (exact versions used on the lab workstation, RTX 3060, CUDA 12.1).
+# Install:  python3.10 -m venv .venv && .venv/bin/pip install -r environment/requirements.txt \
+#               --extra-index-url https://download.pytorch.org/whl/cu121
+# Then apply the timm patch in environment/README.md.
+torch==2.2.1+cu121
+torchvision==0.17.1+cu121
+timm==0.3.2              # old on purpose: the Insect-Foundation code needs it (patch required)
+ultralytics==8.4.161     # YOLO and RT-DETR (and SAM 2.1 for making training cutouts)
+numpy==1.26.4
+opencv-python==4.11.0.86
+pillow==12.3.0
+tqdm==4.70.1
+pandas==2.3.3
+matplotlib==3.10.9
+PyYAML==6.0.3
+tensorboard==2.21.0      # used by training/classification/finetune.py
+einops                   # only for training/pretrain.py (foundation-model pretraining)
+# apps
+gradio==6.29.0
+requests==2.34.2
+mcp>=1.9,<2              # MCP Python SDK 1.x; 2.x renamed the API used in apps/mcp/server.py

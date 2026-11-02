@@ -1,20 +1,17 @@
 """
-MCP server for beetle identification: a second stage on top of the ArthropodModel pipeline.
+MCP server for beetle identification, self-contained (no ArthropodModel needed).
 
-For each specimen in a photo, the foundation pipeline (installed package `arthropod`) detects it,
-pose-aligns it and names its order; specimens that look like beetles (Coleoptera as the first or
-second choice) are then passed to the beetle model, which says SPB (southern pine beetle,
-Dendroctonus frontalis), Cleridae (checkered beetles) or other_Coleoptera.
+For each specimen in a photo, BeetleID's own copy of the pipeline (beetleid/foundation: detect,
+pose-align, name the order) finds it; specimens whose order is Coleoptera are passed to the beetle
+model, which says SPB (southern pine beetle, Dendroctonus frontalis), Cleridae (checkered beetles)
+or other_Coleoptera.
 
 Tool
     identify_beetles   per specimen: order (foundation) and beetle class with probabilities,
                        box, counts; saves an overlay image
 
-Runs with the ArthropodModel environment (it has `arthropod` installed in editable mode):
-    ~/Documents/ArthropodModel/.venv/bin/python ~/Documents/BeetleID/apps/mcp/server.py \
-        --overlay-dir ~/Documents/ArthropodModel/runs/mcp/outputs \
-        --progress-file ~/Documents/ArthropodModel/runs/mcp/logs/progress.jsonl
-(the two options let the ArthropodModel web chat show this server's overlays and live steps).
+Run with any environment built from environment/requirements.txt:
+    python apps/mcp/server.py                      # overlays go to runs/mcp/outputs
 Like the foundation server, stdout is reserved for the MCP protocol; models load on first use.
 """
 
@@ -29,11 +26,10 @@ import uuid
 from collections import Counter
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP
-
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # BeetleID
-BEETLE_MODEL = os.path.join(ROOT, "models", "beetle_classifier_resnet18.pth")
-BEETLE_NAMES = os.path.join(ROOT, "models", "beetle_class_mapping.txt")
+sys.path.insert(0, ROOT)              # the beetleid package, without needing pip install
+
+from mcp.server.fastmcp import FastMCP   # noqa: E402
 EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
 COLEOPTERA = "Coleoptera"
 
@@ -57,21 +53,20 @@ def emit(stage, message):
 
 
 def models():
-    """Foundation pipeline + beetle classifier, loaded once."""
+    """BeetleID's pipeline + beetle classifier, loaded once."""
     with _lock:
         if "pipe" not in _state:
-            emit("load", "loading the foundation pipeline and the beetle model (first call only)")
+            emit("load", "loading the pipeline and the beetle model (first call only)")
             with contextlib.redirect_stdout(sys.stderr):
-                from arthropod import pipeline as sp
+                from beetleid import BeetleClassifier
+                from beetleid.foundation import pipeline as sp
                 _state["pipe"] = sp.Pipeline(
                     sp.first_existing(sp.YOLO_WEIGHTS, "YOLO weights"), sp.RTDETR_WEIGHTS[0],
                     sp.first_existing(sp.CPM_CHECKPOINTS, "CPM checkpoint"),
                     sp.first_existing(sp.CLASSIFIERS, "classifier"),
                     sp.first_existing(sp.CLASS_MAPPINGS, "class mapping"), _args.device, 256, 0.95)
-                model, cargs = sp.load_classifier(BEETLE_MODEL, _state["pipe"].device)
-                _state["beetle"] = model
-                _state["beetle_names"] = sp.load_class_names(BEETLE_NAMES, cargs.nb_classes)
-        return _state["pipe"], _state["beetle"], _state["beetle_names"]
+                _state["beetle"] = BeetleClassifier(_args.device)
+        return _state["pipe"], _state["beetle"]
 
 
 @mcp.tool()
@@ -82,26 +77,24 @@ def identify_beetles(image_path: str, only_beetles: bool = True,
     or other_Coleoptera.  Use it after analyze_tray reports Coleoptera, or whenever the user asks
     about pine beetles, bark beetles or checkered beetles.
 
-    image_path: absolute, or relative to ~/Documents/ArthropodModel.
-    only_beetles: True = only specimens whose order is Coleoptera (first or second choice);
+    image_path: absolute, or relative to the BeetleID folder.
+    only_beetles: True = only specimens whose order is Coleoptera;
         False = run the beetle model on every specimen (useful if the order looks wrong).
     Results from photo setups unlike the training photos are less reliable; mention probabilities.
     """
     import numpy as np
-    import torch
     from PIL import Image
-    from arthropod import paths
     _state["call"] = uuid.uuid4().hex[:8]
     started = time.time()
     emit("start", f"{os.path.basename(image_path)}")
     try:
         full = os.path.expanduser(image_path)
-        full = full if os.path.isabs(full) else os.path.join(paths.ROOT, full)
+        full = full if os.path.isabs(full) else os.path.join(ROOT, full)
         if not os.path.isfile(full) or not full.lower().endswith(EXTS):
             raise ValueError(f"image not found or not an image: {image_path}")
-        pipe, beetle, names = models()
+        pipe, beetle = models()
         image = np.asarray(Image.open(full).convert("RGB"))
-        import arthropod.pipeline as sp
+        from beetleid.foundation import pipeline as sp
         mode = sp.DETECT_RTDETR if detector == "rtdetr" else sp.DETECT_AUTO
         with _lock, contextlib.redirect_stdout(sys.stderr):
             r = pipe.analyze(image, confidence, 0.5, sp.MIN_SCORE, True, mode,
@@ -109,16 +102,14 @@ def identify_beetles(image_path: str, only_beetles: bool = True,
             specimens, vis = [], image.copy()
             for i, ((score, box), (crop, aligned), top) in enumerate(
                     zip(r["dets"], r["crops"], r["preds"]), 1):
-                (c1, p1), (c2, p2) = top
-                order, runner = pipe.class_names[c1], pipe.class_names[c2]
+                (c1, p1), _ = top
+                order = pipe.class_names[c1]
                 s = {"id": i, "order": order, "order_probability": round(p1, 3),
                      "box_xyxy": [int(round(v)) for v in box], "aligned": bool(aligned)}
-                if not only_beetles or COLEOPTERA in (order, runner):
-                    with torch.no_grad():
-                        p = beetle(pipe.cls_transform(Image.fromarray(crop))[None].to(pipe.device)).softmax(1)[0].cpu()
-                    k = int(p.argmax())
-                    s.update(beetle_class=names[k], beetle_probability=round(float(p[k]), 3),
-                             beetle_probabilities={n: round(float(v), 3) for n, v in zip(names, p)})
+                if not only_beetles or order == COLEOPTERA:
+                    b = beetle.classify([crop])[0]
+                    s.update(beetle_class=b["class"], beetle_probability=b["probability"],
+                             beetle_probabilities=b["probabilities"])
                 specimens.append(s)
         found = [s for s in specimens if "beetle_class" in s]
         emit("classify", f"beetle model on {len(found)} of {len(specimens)} specimen(s)")

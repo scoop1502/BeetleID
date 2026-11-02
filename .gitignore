@@ -4,3 +4,4 @@ runs/
 *.pth
 __pycache__/
 *.pyc
+*.egg-info/

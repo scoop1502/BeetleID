@@ -1,11 +1,11 @@
 # Beetle model (3 classes): data, split, results
 
-**Date:** 2026-11-02 · **Model:** `models/beetle_classifier_resnet18.pth` (= `runs/beetle3_B/checkpoint-9.pth`)
+**Date:** 2026-11-02 · **Model:** `models/beetle_classifier_resnet18.pth` (= `runs/beetle3/checkpoint-9.pth`)
 
 ## Design
 
-A second stage after the ArthropodModel pipeline (detect -> align -> order).  Specimens whose
-order is Coleoptera (first or second choice) are passed to a ResNet-18 with three classes:
+A second stage after the detect -> align -> order pipeline.  Specimens whose order is Coleoptera
+are passed to a ResNet-18 with three classes:
 `other_Coleoptera`, `Cleridae`, `SPB_Dendroctonus_frontalis`.  Unlike a 2-class Cleridae/SPB
 model it can say "a beetle, but neither of these".  It starts from the foundation's 21-order
 classifier (which already knows arthropods); only the final layer is new.
@@ -14,7 +14,7 @@ classifier (which already knows arthropods); only the final layer is new.
 
 | Class | Train | Val | Source |
 |---|---|---|---|
-| other_Coleoptera | 1,693 | 321 | the foundation's Coleoptera crops, its own train/val split (by photo) |
+| other_Coleoptera | 1,693 | 321 | `data/other_coleoptera`: the order dataset's Coleoptera crops, its train/val split (by photo) |
 | Cleridae | 20 photos ×20 = 400 | 7 (2 specimens) | `data/new_classes`, split **by specimen**: 002252-002253 val only |
 | SPB | 63 photos ×7 = 441 | 16 (3 specimens) | `data/new_classes`, split **by specimen**: 002244 onwards val only |
 
@@ -27,7 +27,10 @@ or pink background, no label card or ruler; 16 specimen crops after detection.
 10 epochs from the 21-order classifier, batch 16, seed 0 (~50 s on an RTX 3060).  Two variants:
 **A** standard (random crops only), **B** with `--color_aug` (colour jitter + random greyscale, a
 new opt-in flag in ArthropodModel's `finetune.py`).  Rule fixed before testing: keep B unless its
-validation accuracy is more than 1 point below A's.  Both reached 99.71% -> **B is production.**
+validation accuracy is more than 1 point below A's.  Both reached 99.71% -> **B's recipe is production.**
+B was then retrained with BeetleID's own copy of the code and data (`training/build_and_train_beetle3.sh`
+-> `runs/beetle3`): identical per-class validation results (321/321, 7/7, 15/16); that run is the
+production model.
 
 Finding while doing this: `finetune.py` silently ignored `--aa` / `--color_jitter`; its training
 transform had random crops only, so no classifier in the project had seen colour or lighting
@@ -47,7 +50,8 @@ variation.  `--color_aug` is off by default, so earlier runs are unchanged.
 On the out-of-domain photos every crop is called `other_Coleoptera`: a safe failure (it does not
 invent Cleridae), but the model has not learned SPB beyond its one photo session.  The foundation
 itself calls only 4 of these 16 specimens Coleoptera (9 Collembola, 3 Hymenoptera), which is why
-the MCP tool also accepts Coleoptera as second choice and offers `only_beetles=False`.
+BeetleID's own MCP tool offers `only_beetles=False` (check every specimen).  As a plug-in in
+ArthropodModel only specimens classified Coleoptera reach it, so these photos would not.
 
 ## What would fix the out-of-domain gap
 

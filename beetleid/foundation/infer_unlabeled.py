@@ -1,0 +1,782 @@
+"""
+Inference for CPM keypoint model on unlabelled / unannotated images.
+
+The model was trained on *crops* of the insect (see insect_dataset.py: the image is
+cropped to the annotated bounding box, then resized so the long side is 224 and
+zero-padded bottom/right).  So at inference time we must supply a box too.
+Without annotations the box comes from one of:
+
+    --box-mode auto    : segment the insect automatically (default).  The search is
+                         restricted to the middle --roi-frac of the frame, because in
+                         low-magnification shots the off-centre litter is often larger
+                         and browner than a pale specimen and would otherwise win.
+    --box-mode full    : use the whole image (only correct if images are already crops)
+    --box-mode file    : read boxes from a JSON file {"filename.jpg": [x1, y1, x2, y2], ...}
+
+The input directory is walked recursively and any subdirectory structure -- e.g. one
+folder per class -- is mirrored in both output trees, so labels carried by the folder
+layout survive the export.  The CSV names images by their path relative to --input.
+
+Outputs, per image (<sub> being the image's subdirectory under --input, if any):
+    <out>/<sub>/<name>            visualisation on the ORIGINAL image (same filename)
+    <out>/keypoints.csv           keypoint coords in ORIGINAL image pixels + confidence
+
+Every input image produces an overlay, a CSV row and (with --save-crops) a crop; nothing
+is skipped.  A file that cannot be decoded (corrupt or truncated) is the one exception:
+it gets a CSV row with box_source=unreadable and no images, and the run carries on.
+keypoints.csv and --list-file are written incrementally, so an interrupted run keeps
+everything finished up to that point.  In --box-mode auto the detector can still fail to find a specimen at all --
+a frame of bare substrate, or one where the animal is a pale speck among larger debris.
+Such a frame is run on the whole image, its CSV row carries box_source=no-subject and
+crop=no-subject, and its keypoints are meaningless and should be filtered on those
+columns.  With the default --align-fallback crop its export is the full frame
+(pure background), so filter it out before training; --align-fallback skip drops it from
+--save-crops and --list-file instead.  In --box-mode file an image missing from the JSON
+is likewise run on the full frame with box_source=no-box.  The run prints a summary of
+no-subject frames at the end; feed them back through --box-mode file with hand-drawn
+boxes.
+
+Optional exports for downstream ViT training (see docs/inference_guide.pdf):
+    --save-crops DIR    pose-normalised specimen crops -- cropped AND rotated/scaled
+                        (MAE pre-training input).  Rotation comes from two predicted
+                        keypoints; zoom comes from the detected box, so every specimen
+                        fills the same fraction of the frame no matter how close the
+                        original shot was.  See --align-scale-mode.
+    --list-file PATH    newline-separated image paths for ImageDatasetListV2
+
+Usage:
+    python tools/infer_unlabeled.py --input data/images/inference --output output/inference
+"""
+
+import os
+import csv
+import json
+import math
+import inspect
+import argparse
+
+import cv2
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+from PIL import Image
+from tqdm import tqdm
+
+from .cpm_model_v2 import CPM
+
+TARGET_SIZE = 224
+STRIDE = 8  # 224 / 28, the heatmap downsampling factor
+N_POINTS = 5
+
+# insect_dataset.py builds heatmaps from lmks[:, :, [3,4,5,6,7]], i.e. the 8-point
+# annotation's keypoints 4..8 (1-indexed).  Channel 0 of the model output is background.
+KP_NAMES = ["kp4", "kp5", "kp6", "kp7", "kp8"]
+
+
+def gaussian(x, y, H, W, sigma=5):
+    """2D gaussian kernel centred at (x, y) -- same helper as insect_dataset.py."""
+    channel = [math.exp(-((c - x) ** 2 + (r - y) ** 2) / (2 * sigma ** 2))
+               for r in range(H) for c in range(W)]
+    channel = np.array(channel, dtype=np.float32)
+    # Positional, not newshape=: NumPy 2.1 renamed that keyword to `shape`.
+    return np.reshape(channel, (H, W))
+
+
+def heatmap2coord(heatmap, topk=5):
+    """Soft-argmax over the topk peaks. Returns coords in 224-space."""
+    N, C, H, W = heatmap.shape
+    score, index = heatmap.view(N, C, 1, -1).topk(topk, dim=-1)
+    coord = torch.cat([index % W, torch.div(index, W, rounding_mode="floor")], dim=2)
+    coord = (coord * torch.nn.functional.softmax(score, dim=-1)).sum(-1) * STRIDE
+    return coord
+
+
+def select_contour(contours, w, h, roi_frac, exempt_frac):
+    """
+    Choose the specimen contour, preferring blobs near the centre of the frame.
+
+    Plain argmax(area) fails on low-magnification frames: the operator centres the
+    animal, but the litter around it is not centred and can easily be *larger* and
+    *browner* than a pale specimen, so the biggest saturated blob is a wood chip
+    rather than the mite.  Restricting the search to a centred window fixes that.
+
+    The window filters blob *centroids* only -- the chosen contour keeps its full
+    extent.  Cropping the image first would be much simpler and much wronger: the
+    lateral beetle shots span ~29% of the frame, so a 60% centre crop would slice
+    the animal and the box would then understate its true size.
+
+    A blob covering more than `exempt_frac` of the frame bypasses the window: at
+    that size it cannot be debris (the largest clutter measured here is 0.41% of
+    the frame), and refusing an obvious specimen for sitting off-centre would lose
+    more than the filter gains.
+
+    Returns the chosen contour, or None if the window left nothing.
+    """
+    if roi_frac >= 1.0:
+        return max(contours, key=cv2.contourArea)
+
+    x1, x2 = w * (1 - roi_frac) / 2.0, w * (1 + roi_frac) / 2.0
+    y1, y2 = h * (1 - roi_frac) / 2.0, h * (1 + roi_frac) / 2.0
+    exempt_area = exempt_frac * w * h
+
+    central = []
+    for c in contours:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        cx, cy = bx + bw / 2.0, by + bh / 2.0
+        if (x1 <= cx <= x2 and y1 <= cy <= y2) or cv2.contourArea(c) >= exempt_area:
+            central.append(c)
+
+    if not central:
+        return None
+    return max(central, key=cv2.contourArea)
+
+
+def detect_box(image_np, margin=0.15, min_area_frac=1e-4, roi_frac=1.0,
+               roi_exempt_frac=0.05):
+    """
+    Locate the insect in a raw frame.
+
+    These are microscope shots: the specimen is coloured (tan/brown) while the
+    background -- paper, grid lines, dust -- is essentially achromatic.  So we
+    threshold the HSV saturation channel and keep the largest blob, subject to the
+    centre window described in select_contour.
+
+    Returns ((x1, y1, x2, y2), side) -- the box clipped to the frame, plus the
+    *unclipped* square side it was built from.  Alignment needs the latter: a
+    specimen wider than the frame is tall (the lateral beetle shots) has its box
+    clipped vertically, so the clipped box understates the animal's true extent
+    and would make it come out too small.  Returns None if nothing convincing
+    was found.
+    """
+    h, w = image_np.shape[:2]
+    hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+
+    sat = cv2.GaussianBlur(sat, (9, 9), 0)
+    _, mask = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    biggest = select_contour(contours, w, h, roi_frac, roi_exempt_frac)
+    if biggest is None or cv2.contourArea(biggest) < min_area_frac * h * w:
+        return None
+
+    bx, by, bw, bh = cv2.boundingRect(biggest)
+
+    # Legs and antennae are thin and pale, so the saturation blob under-covers the
+    # animal.  Pad outwards, and square the box up -- training crops were whole
+    # animals, not tight body-only boxes.
+    side = max(bw, bh) * (1.0 + 2 * margin)
+    cx, cy = bx + bw / 2.0, by + bh / 2.0
+    x1 = max(0.0, cx - side / 2.0)
+    y1 = max(0.0, cy - side / 2.0)
+    x2 = min(float(w), cx + side / 2.0)
+    y2 = min(float(h), cy + side / 2.0)
+    return (x1, y1, x2, y2), side
+
+
+def preprocess(pil_image, box):
+    """
+    Reproduce insect_dataset.__getitem__ preprocessing exactly:
+    crop to box -> resize by min(224/w, 224/h) -> paste top-left into a 224x224 canvas.
+
+    Returns (canvas_rgb_uint8, scale, x1, y1) -- the last three let us map
+    predictions back to original-image pixels.
+    """
+    w, h = pil_image.size
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0.0, x1), max(0.0, y1)
+    x2, y2 = min(float(w), x2), min(float(h), y2)
+
+    crop = pil_image.crop([x1, y1, x2, y2])
+    cw, ch = crop.size
+    scale = min(TARGET_SIZE / cw, TARGET_SIZE / ch)
+
+    resized = cv2.resize(np.asarray(crop), None, fx=scale, fy=scale)
+    rh, rw, _ = resized.shape
+
+    canvas = np.zeros((TARGET_SIZE, TARGET_SIZE, 3), dtype=np.uint8)
+    canvas[:rh, :rw, :] = resized
+    return canvas, scale, x1, y1
+
+
+def axis_theta(p_a, p_b):
+    """
+    The rotation align_crop applies to send the p_a -> p_b axis straight down, in degrees
+    over [-180, 180) -- i.e. the specimen's orientation.  None if the points coincide.
+    """
+    dx, dy = float(p_b[0] - p_a[0]), float(p_b[1] - p_a[1])
+    if math.hypot(dx, dy) < 1e-6:
+        return None
+    return (90.0 - math.degrees(math.atan2(dy, dx)) + 180.0) % 360.0 - 180.0
+
+
+def align_crop(image_rgb, p_a, p_b, size=256, frac_a=0.35, frac_b=0.65,
+               scale=None, centre=None):
+    """
+    Pose-normalise a specimen using two predicted keypoints.
+
+    Builds a similarity transform (rotation + uniform scale + translation) that puts
+    the p_a -> p_b body axis vertical, so rotation stops being a nuisance variable
+    before ViT training.  Where the *scale* comes from is the caller's choice:
+
+    keypoints mode (scale=None, the original behaviour)
+        Sends p_a -> (size/2, size*frac_a) and p_b -> (size/2, size*frac_b), so the
+        anchor axis always measures size*(frac_b - frac_a) px:
+
+            s = |q_b - q_a| / |p_b - p_a|
+
+        Beware: s is inversely proportional to the predicted anchor distance, which
+        is neither proportional to body size (it depends on pose and on which
+        landmarks the taxon actually exposes) nor stable (a low-confidence pair
+        collapses towards one blob centre, shrinking |p_b - p_a| and blowing s up).
+        The practical effect is that a specimen photographed *closer* has a larger
+        anchor distance and so comes out *smaller* -- the framing gets inverted.
+
+    box mode (scale given)
+        s is passed in, computed from the detected specimen extent, and only the
+        rotation is taken from the keypoints.  The output is centred on `centre`
+        (the box centre) rather than pinned through the anchors.  Apparent specimen
+        size is then the same for every image regardless of shot distance, and a
+        degenerate anchor pair costs a wrong rotation instead of a wild zoom.
+
+        theta = atan2(q_b - q_a) - atan2(p_b - p_a)
+        M     = [[s*cos, -s*sin, tx],
+                 [s*sin,  s*cos, ty]],   t = q_centre - R @ centre
+
+    Returns a (size, size, 3) RGB array, or None if the two points coincide.
+    """
+    q_a = np.array([size / 2.0, size * frac_a])
+    q_b = np.array([size / 2.0, size * frac_b])
+
+    p_a = np.asarray(p_a, dtype=np.float64)
+    p_b = np.asarray(p_b, dtype=np.float64)
+    d = p_b - p_a
+    e = q_b - q_a
+    norm_d = np.linalg.norm(d)
+    if norm_d < 1e-6:
+        return None
+
+    s = np.linalg.norm(e) / norm_d if scale is None else float(scale)
+    theta = math.atan2(e[1], e[0]) - math.atan2(d[1], d[0])
+    cos_t, sin_t = s * math.cos(theta), s * math.sin(theta)
+
+    R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+    # Anchor the translation on the box centre in box mode, on p_a otherwise: with an
+    # externally supplied s the anchors no longer land on q_a/q_b, so pinning through
+    # them would push the specimen off-frame by the scale mismatch.
+    if scale is None:
+        t = q_a - R @ p_a
+    else:
+        src = np.asarray(centre if centre is not None else (p_a + p_b) / 2.0,
+                         dtype=np.float64)
+        t = np.array([size / 2.0, size / 2.0]) - R @ src
+    M = np.hstack([R, t.reshape(2, 1)])
+
+    return cv2.warpAffine(image_rgb, M, (size, size), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def letterbox(image_rgb, size):
+    """
+    Fit a crop onto a size x size canvas, aspect preserved, centred, zero-padded.
+
+    Used only for specimens that could not be aligned (see --align-fallback), so that
+    every file in the export directory still has the same geometry.
+    """
+    h, w = image_rgb.shape[:2]
+    if h == 0 or w == 0:
+        return None
+
+    scale = min(size / w, size / h)
+    resized = cv2.resize(image_rgb, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                         interpolation=cv2.INTER_CUBIC)
+    rh, rw = resized.shape[:2]
+
+    canvas = np.zeros((size, size, 3), dtype=image_rgb.dtype)
+    top, left = (size - rh) // 2, (size - rw) // 2
+    canvas[top:top + rh, left:left + rw] = resized
+    return canvas
+
+
+def square_crop(image_rgb, box, box_side, size, fill):
+    """
+    The --align-fallback crop: align_crop's box-mode framing with the rotation left out.
+
+    Centred on the box, scaled so the box's unclipped side spans `fill` of a size x size
+    square, with the frame's edge pixels replicated where the square runs past it -- so
+    an unaligned crop is framed exactly like an aligned one, minus the turn, and never
+    carries black padding the aligned crops do not have.
+    """
+    x1, y1, x2, y2 = box
+    s = size * fill / max(box_side, 1e-6)
+    M = np.array([[s, 0.0, size / 2.0 - s * (x1 + x2) / 2.0],
+                  [0.0, s, size / 2.0 - s * (y1 + y2) / 2.0]])
+    return cv2.warpAffine(image_rgb, M, (size, size), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def find_images(root):
+    """
+    Walk `root`, returning image paths *relative* to it so the outputs can mirror the
+    input tree.
+
+    Class-labelled corpora keep specimens in per-class subdirectories, and the label
+    lives only in the directory name -- so flattening the export would throw it away.
+    Worse, two classes may each contain an `001.jpg`, and a flat export would have one
+    silently overwrite the other.
+    """
+    # os.walk swallows a missing directory and simply yields nothing, which would leave the
+    # whole run a silent no-op.  Check explicitly so a mistyped --input fails loudly.
+    if not os.path.isdir(root):
+        raise SystemExit(f"[error] --input is not a directory: {os.path.abspath(root)}")
+
+    found = []
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            if name.lower().endswith(IMAGE_EXTS):
+                found.append(os.path.relpath(os.path.join(dirpath, name), root))
+    return sorted(found)
+
+
+def load_model(checkpoint_path, device):
+    """
+    Load the CPM checkpoint, spanning the torch versions this repo gets run under.
+
+    PyTorch 2.6 flipped `weights_only` to True, which refuses this checkpoint because it
+    carries numpy scalars -- fine to unpickle, since the file is produced by train.py in
+    this repo rather than fetched from anywhere.  But the keyword did not exist before
+    1.13, and the pinned insect_model environment is on 1.12, so passing it
+    unconditionally would break the very environment the guide tells you to use.  Ask the
+    installed torch which it is.
+    """
+    model = CPM(N_POINTS).to(device).eval()
+
+    load_kwargs = {"map_location": "cpu"}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = False
+
+    checkpoint = torch.load(checkpoint_path, **load_kwargs)["state_dict"]
+    state_dict = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+    model.load_state_dict(state_dict)
+    return model
+
+
+def draw(image_bgr, coords, scores, box=None):
+    out = image_bgr.copy()
+    radius = max(2, int(round(min(out.shape[:2]) / 200)))
+    thickness = max(1, radius // 2)
+
+    if box is not None:
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), thickness)
+
+    for i, ((x, y), s) in enumerate(zip(coords, scores)):
+        x, y = int(round(x)), int(round(y))
+        cv2.circle(out, (x, y), radius * 2, (255, 0, 0), -1)
+        cv2.putText(out, f"{KP_NAMES[i]} {s:.2f}", (x + radius * 2, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, radius / 6.0, (255, 0, 0), thickness, cv2.LINE_AA)
+    return out
+
+
+def select_device(requested, strict=False):
+    """
+    Resolve --device, degrading to CPU when CUDA is present but not actually usable.
+
+    torch.cuda.is_available() only reports that a driver and device were enumerated.
+    On a shared cluster the GPU is often in Exclusive_Process compute mode and already
+    claimed by another job, so it reports True and the refusal ("CUDA-capable device(s)
+    is/are busy or unavailable") surfaces later, on the first real allocation.  Probe
+    with a one-element tensor here so the fallback happens before the checkpoint load.
+    """
+    if requested == "cpu":
+        return torch.device("cpu")
+
+    if not torch.cuda.is_available():
+        reason = "no CUDA device visible"
+    else:
+        try:
+            torch.zeros(1, device=requested)
+            return torch.device(requested)
+        except (RuntimeError, AssertionError) as exc:
+            reason = str(exc).splitlines()[0]
+
+    if strict:
+        raise SystemExit(f"[error] {requested} unusable: {reason}")
+    print(f"[warn] {requested} unusable ({reason}); falling back to CPU")
+    return torch.device("cpu")
+
+
+def main(args):
+    device = select_device(args.device, strict=args.strict_device)
+    os.makedirs(args.output, exist_ok=True)
+
+    model = load_model(args.checkpoint, device)
+    to_tensor = transforms.ToTensor()
+
+    # The centre map is a fixed gaussian at the image centre -- identical for every
+    # sample in training, so build it once.
+    centermap = gaussian(TARGET_SIZE // 2, TARGET_SIZE // 2, TARGET_SIZE, TARGET_SIZE)
+    centermap = torch.from_numpy(centermap)[None, None].to(device)
+
+    manual_boxes = {}
+    if args.box_mode == "file":
+        with open(args.boxes, "r") as handle:
+            manual_boxes = json.load(handle)
+
+    if args.save_crops:
+        os.makedirs(args.save_crops, exist_ok=True)
+
+    align_a, align_b = (KP_NAMES.index(f"kp{v}") for v in args.align_pair.split(","))
+
+    files = find_images(args.input)
+    if not files:
+        raise SystemExit(f"[error] no images under {os.path.abspath(args.input)} "
+                         f"(searched recursively for {', '.join(IMAGE_EXTS)})")
+    print(f"Found {len(files)} images under {os.path.abspath(args.input)}")
+
+    # keypoints.csv and --list-file are streamed one line per image and flushed, so a
+    # crash or a wall-clock kill part-way through an 11k-image corpus leaves every
+    # finished image on disk rather than losing the whole table at the end.
+    csv_fields = ["filename", "box", "box_source", "crop"]
+    for kp_name in KP_NAMES:
+        csv_fields += [f"{kp_name}_x", f"{kp_name}_y", f"{kp_name}_score"]
+    # Appended last so readers of the original columns are unaffected; blank unless the
+    # file-mode cross-check ran (see cross_check below).
+    csv_fields += ["check", "run", "disagreement"]
+    csv_path = os.path.join(args.output, "keypoints.csv")
+    csv_handle = open(csv_path, "w", newline="")
+    writer = csv.DictWriter(csv_handle, fieldnames=csv_fields)
+    writer.writeheader()
+    csv_handle.flush()
+    list_handle = open(args.list_file, "w") if args.list_file else None
+
+    def emit(row):
+        rows.append(row)
+        writer.writerow(row)
+        csv_handle.flush()
+
+    def predict(pil_image, box):
+        """Run the CPM on one box; keypoints in ORIGINAL image pixels, plus scores."""
+        canvas, scale, ox, oy = preprocess(pil_image, box)
+        with torch.no_grad():
+            tensor = to_tensor(Image.fromarray(canvas)).unsqueeze(0).to(device)
+            preds = model(tensor, centermap)
+            final = preds[-1].cpu()          # last CPM stage, shape (1, 6, 28, 28)
+            final = final[:, 1:]             # drop the background channel
+
+        coords224 = heatmap2coord(final, topk=args.topk).numpy()[0]
+        scores = final[0].flatten(1).max(dim=1).values.numpy()
+
+        # 224-space -> crop-space -> original image pixels
+        coords = coords224 / scale
+        coords[:, 0] += ox
+        coords[:, 1] += oy
+        return coords, scores
+
+    def cross_check(image_np, pil_image, file_candidate):
+        """
+        Second opinion for --box-mode file.  The CPM's keypoints depend on how the box
+        frames the specimen, and file boxes from yolo_predict_boxes.py (whole animal,
+        appendages included) and detect_box's boxes (body-centred squares) each frame
+        some specimens badly -- on different images.  So predict on both and cross-check.
+
+        A candidate is usable when its box is a real one (not no-box / no-subject) and
+        both anchors clear --align-min-score.  Both usable and axes within --agree-deg:
+        take the more confident (ties to the file box).  One usable: take it.  Both usable
+        but the axes disagree: one prediction is wrong and its score cannot say which, so
+        the image is left unaligned (check=conflict), as it is when neither is usable
+        (check=none).  Returns (candidate, check, run, disagreement).
+        """
+        candidates = {"file": file_candidate}
+        detected = detect_box(image_np, margin=args.margin, roi_frac=args.roi_frac,
+                              roi_exempt_frac=args.roi_exempt_frac)
+        if detected is not None:
+            auto_box, auto_side = detected
+            candidates["auto"] = (auto_box, auto_side, "detected",
+                                  *predict(pil_image, auto_box))
+
+        theta, confidence = {}, {}
+        for run, (_, _, source, coords, scores) in candidates.items():
+            confidence[run] = float(min(scores[align_a], scores[align_b]))
+            if source in ("manual", "detected") and confidence[run] >= args.align_min_score:
+                t = axis_theta(coords[align_a], coords[align_b])
+                if t is not None:
+                    theta[run] = t
+
+        if len(theta) == 2:
+            diff = abs((theta["file"] - theta["auto"] + 180.0) % 360.0 - 180.0)
+            if diff >= args.agree_deg:
+                return candidates["file"], "conflict", "file", round(diff, 1)
+            run = "auto" if confidence["auto"] > confidence["file"] else "file"
+            return candidates[run], "agree", run, round(diff, 1)
+        if len(theta) == 1:
+            run = next(iter(theta))
+            return candidates[run], f"{run}-only", run, ""
+        # Neither usable: keep whichever box actually found the specimen, for the
+        # unaligned crop -- the whole frame only if neither did.
+        run = "file" if file_candidate[2] == "manual" or "auto" not in candidates else "auto"
+        return candidates[run], "none", run, ""
+
+    exported = []
+    rows = []
+    for relpath in tqdm(files, desc="Inference"):
+        path = os.path.join(args.input, relpath)
+        # Everything downstream mirrors `subdir`, so an input tree of class folders comes
+        # back out as the same tree of class folders.  `filename` keeps the relative path
+        # in POSIX form: it is what the CSV and the log lines identify an image by, and
+        # forward slashes keep those readable on either platform.
+        subdir, name = os.path.split(relpath)
+        filename = relpath.replace(os.sep, "/")
+
+        # A truncated or corrupt file (a partial copy, a zero-byte transfer) must not
+        # abort the run and take the whole CSV with it.  Record it and move on; the
+        # end-of-run summary lists these so they can be re-copied and re-run.
+        try:
+            pil_image = Image.open(path).convert("RGB")
+        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+            print(f"  [unreadable] {filename}: {exc}")
+            row = {"filename": filename, "box": "", "box_source": "unreadable",
+                   "crop": "unreadable"}
+            for kp_name in KP_NAMES:
+                row[f"{kp_name}_x"] = row[f"{kp_name}_y"] = row[f"{kp_name}_score"] = ""
+            emit(row)
+            continue
+        image_np = np.asarray(pil_image)
+        h, w = image_np.shape[:2]
+
+        # box_side is the specimen extent used to scale the aligned crop.  It tracks the
+        # box the detector actually wanted, before clipping to the frame, so specimens
+        # running off the edge are not scaled down by the amount that got cut away.
+        if args.box_mode == "file":
+            # Accept either the relative path (in whichever slash style the JSON was
+            # written with) or a bare basename, so hand-written box files keyed on plain
+            # filenames keep working against a nested input tree.
+            box = next((manual_boxes[k] for k in (filename, relpath, name)
+                        if k in manual_boxes), None)
+            if box is None:
+                # No hand box: fall through to the whole frame rather than dropping the
+                # image, so every input still yields an overlay, a CSV row and a crop.
+                print(f"  [no-box] {filename}: not in {args.boxes}, using the full frame")
+                box, box_side = (0.0, 0.0, float(w), float(h)), float(max(w, h))
+                box_source = "no-box"
+            else:
+                box_side = max(box[2] - box[0], box[3] - box[1])
+                box_source = "manual"
+        elif args.box_mode == "auto":
+            detected = detect_box(image_np, margin=args.margin,
+                                  roi_frac=args.roi_frac,
+                                  roi_exempt_frac=args.roi_exempt_frac)
+            if detected is None:
+                # Nothing convincing in frame.  Carry on so the overlay and the CSV row
+                # still document what happened, but the full-frame box below is a
+                # placeholder for drawing -- NOT a detection.  box_source carries that
+                # distinction to every consumer downstream.
+                print(f"  [no-subject] {filename}: nothing convincing found")
+                box, box_side = (0.0, 0.0, float(w), float(h)), float(max(w, h))
+                box_source = "no-subject"
+            else:
+                box, box_side = detected
+                box_source = "detected"
+        else:
+            box, box_side = (0.0, 0.0, float(w), float(h)), float(max(w, h))
+            box_source = "full-frame"
+
+        coords, scores = predict(pil_image, box)
+
+        check, run, disagreement = "", "", ""
+        if args.box_mode == "file" and not args.no_cross_check:
+            (box, box_side, box_source, coords, scores), check, run, disagreement = \
+                cross_check(image_np, pil_image, (box, box_side, box_source, coords, scores))
+
+        # The overlay is a full-resolution re-encode of the source frame, so it dominates both
+        # runtime and disk once the corpus is large.  --no-vis drops it; keypoints.csv still
+        # records every coordinate, so nothing quantitative is lost.
+        if not args.no_vis:
+            vis = draw(cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR), coords, scores,
+                       box=box if args.draw_box else None)
+            vis_dir = os.path.join(args.output, subdir)
+            os.makedirs(vis_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(vis_dir, name), vis)
+
+        stem = os.path.splitext(name)[0]
+        status = ""
+
+        # Specimen crop, pose-normalised: the similarity transform crops, rotates and
+        # rescales in one step, so this is both the crop and the alignment.  It is the
+        # input for MAE pre-training, which applies its own RandomResizedCrop and so
+        # wants --align-size > 224 for headroom.
+        # Alignment needs both anchor keypoints, so specimens the model is unsure about
+        # are either skipped or exported unaligned, per --align-fallback.
+        if args.save_crops:
+            crop = None
+            reason = None
+
+            if box_source == "no-subject":
+                reason = "no subject detected"
+            elif check == "conflict":
+                reason = f"file and auto boxes disagree on the body axis by {disagreement} deg"
+            elif check == "none":
+                reason = "no usable anchors from either box"
+            elif min(scores[align_a], scores[align_b]) < args.align_min_score:
+                reason = (f"anchor score below {args.align_min_score} "
+                          f"({scores[align_a]:.2f}, {scores[align_b]:.2f})")
+            else:
+                if args.align_scale_mode == "box":
+                    box_scale = args.align_size * args.align_fill / max(box_side, 1e-6)
+                    box_centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+                else:
+                    box_scale, box_centre = None, None
+                crop = align_crop(image_np, coords[align_a], coords[align_b],
+                                  size=args.align_size,
+                                  frac_a=0.5 - args.align_span / 2.0,
+                                  frac_b=0.5 + args.align_span / 2.0,
+                                  scale=box_scale, centre=box_centre)
+                if crop is None:
+                    reason = "anchor keypoints coincide"
+
+            status = "aligned"
+            if reason is not None:
+                if args.align_fallback == "crop":
+                    # Same square framing as an aligned crop, without the rotation (see
+                    # square_crop).  For a no-subject frame `box` is the whole frame, so this
+                    # exports the full frame.  It is still written so that no input goes
+                    # missing from the export; box_source/crop in the CSV flag it.
+                    crop = square_crop(image_np, box, box_side, args.align_size, args.align_fill)
+                    status = "no-subject" if box_source == "no-subject" else "unaligned"
+                    print(f"  [{status}] {filename}: {reason}")
+                else:
+                    status = "no-subject" if box_source == "no-subject" else "skipped"
+                    print(f"  [skip] {filename}: {reason}")
+
+            if crop is not None:
+                crop_dir = os.path.join(args.save_crops, subdir)
+                os.makedirs(crop_dir, exist_ok=True)
+                crop_path = os.path.join(crop_dir, f"{stem}.jpg")
+                cv2.imwrite(crop_path, cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+                exported.append(os.path.abspath(crop_path))
+                if list_handle is not None:
+                    list_handle.write(exported[-1] + "\n")
+                    list_handle.flush()
+
+        row = {"filename": filename, "box": " ".join(f"{v:.1f}" for v in box),
+               "box_source": box_source, "crop": status}
+        for kp_name, (x, y), s in zip(KP_NAMES, coords, scores):
+            row[f"{kp_name}_x"] = round(float(x), 2)
+            row[f"{kp_name}_y"] = round(float(y), 2)
+            row[f"{kp_name}_score"] = round(float(s), 4)
+        row.update(check=check, run=run, disagreement=disagreement)
+        emit(row)
+
+    csv_handle.close()
+    print(f"Wrote {len(rows)} rows to {csv_path}")
+    if list_handle is not None:
+        list_handle.close()
+        print(f"Wrote {len(exported)} paths to {args.list_file}")
+
+    checks = [r["check"] for r in rows if r.get("check")]
+    if checks:
+        print(f"\n[cross-check] file vs auto boxes over {len(checks)} images:")
+        for check in ("agree", "file-only", "auto-only", "conflict", "none"):
+            n = checks.count(check)
+            print(f"               {check:<10} {n:>6}  {100 * n / len(checks):5.1f}%")
+
+    unreadable = [r["filename"] for r in rows if r["box_source"] == "unreadable"]
+    if unreadable:
+        print(f"\n[unreadable] {len(unreadable)}/{len(rows)} files could not be decoded "
+              f"(corrupt or truncated); no overlay or crop was written for them.")
+        print("             Re-copy these from the source and re-run on just those files.")
+        for f in unreadable[:20]:
+            print(f"               {f}")
+        if len(unreadable) > 20:
+            print(f"               ... and {len(unreadable) - 20} more")
+
+    # A no-subject frame still gets a CSV row and an overlay, so without this the only
+    # trace of it is one line buried in the per-image log.  Surface the count, and name
+    # the images while the list is short enough to act on by hand.
+    no_subject = [r["filename"] for r in rows if r["box_source"] == "no-subject"]
+    if no_subject:
+        exported_note = ("their crops are full frames"
+                         if args.save_crops and args.align_fallback == "crop"
+                         else "no crop was exported")
+        print(f"\n[no-subject] {len(no_subject)}/{len(rows)} images had no detectable "
+              f"specimen; their keypoints are meaningless and {exported_note}.")
+        print("             Filter these out with box_source == 'no-subject', or supply "
+              "boxes by hand and re-run with --box-mode file.")
+        for f in no_subject[:20]:
+            print(f"               {f}")
+        if len(no_subject) > 20:
+            print(f"               ... and {len(no_subject) - 20} more")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input", default="data/images/inference")
+    parser.add_argument("--output", default="output/inference")
+    parser.add_argument("--checkpoint", default=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models", "keypoints_cpm_epoch240.pth"))
+    parser.add_argument("--box-mode", choices=["auto", "full", "file"], default="auto")
+    parser.add_argument("--boxes", default="boxes.json", help="used with --box-mode file")
+    parser.add_argument("--no-cross-check", action="store_true",
+                        help="with --box-mode file, use the file boxes alone instead of "
+                             "also predicting on detect_box's box and cross-checking the two")
+    parser.add_argument("--agree-deg", type=float, default=45.0,
+                        help="cross-check: largest body-axis difference (degrees) at which "
+                             "the file and auto predictions still count as agreeing")
+    parser.add_argument("--margin", type=float, default=0.15,
+                        help="fraction to expand the auto-detected box by")
+    parser.add_argument("--roi-frac", type=float, default=0.6,
+                        help="with --box-mode auto, only consider blobs whose centre "
+                             "falls in this centred fraction of the frame; 1.0 searches "
+                             "everywhere.  Measured safe range on the current corpus is "
+                             "0.34-0.72: below that it starts rejecting real specimens, "
+                             "above it the off-centre litter comes back")
+    parser.add_argument("--roi-exempt-frac", type=float, default=0.05,
+                        help="blobs covering more than this fraction of the frame ignore "
+                             "--roi-frac; keeps a large obvious specimen that happens to "
+                             "sit off-centre.  Well above the largest debris seen (0.4%%)")
+    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--strict-device", action="store_true",
+                        help="fail instead of falling back to CPU when the GPU is unusable")
+    parser.add_argument("--draw-box", action="store_true", help="draw the crop box on outputs")
+    parser.add_argument("--no-vis", action="store_true",
+                        help="skip the overlay images entirely; keypoints.csv is still "
+                             "written to --output.  Use with --save-crops when you only want "
+                             "the exported crops")
+
+    # Exports for downstream ViT training
+    parser.add_argument("--save-crops", default=None, metavar="DIR",
+                        help="write pose-normalised specimen crops (MAE input)")
+    parser.add_argument("--align-pair", default="4,8",
+                        help="the two keypoint IDs defining the body axis, e.g. 4,8")
+    parser.add_argument("--align-size", type=int, default=256,
+                        help="side length of the crop; keep > 224 for RandomResizedCrop")
+    parser.add_argument("--align-scale-mode", choices=["box", "keypoints"], default="box",
+                        help="what sets the zoom: the detected specimen box (consistent "
+                             "apparent size across shot distances) or the anchor keypoint "
+                             "distance (legacy; inverts framing and is noise-sensitive)")
+    parser.add_argument("--align-fill", type=float, default=0.95,
+                        help="with --align-scale-mode box, fraction of the output side "
+                             "spanned by the specimen box; lower zooms out")
+    parser.add_argument("--align-span", type=float, default=0.30,
+                        help="with --align-scale-mode keypoints, fraction of the output "
+                             "height spanned by the anchor axis; lower zooms out")
+    parser.add_argument("--align-min-score", type=float, default=0.3,
+                        help="treat a specimen as unalignable if either anchor scores below this")
+    parser.add_argument("--align-fallback", choices=["skip", "crop"], default="crop",
+                        help="what to export for unalignable specimens (low anchor score "
+                             "or no subject): the box cropped square like an aligned crop "
+                             "but not rotated, edge-filled, --align-size (default), or nothing")
+    parser.add_argument("--list-file", default=None, metavar="PATH",
+                        help="write exported image paths for ImageDatasetListV2")
+    main(parser.parse_args())
