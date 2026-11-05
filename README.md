@@ -25,15 +25,14 @@ installed in its environment: specimens it classifies as **Coleoptera** (and onl
 | `apps/mcp/server.py` | standalone MCP server, tool `identify_beetles` (beetles only by default) | yes |
 | `training/build_and_train_beetle3.sh` | rebuilds the dataset and trains the beetle model (~1 min) | yes |
 | `training/classification/`, `training/util/` | training code (`finetune.py`, with `--color_aug`) | yes |
-| `training/HOW_THE_23CLASS_MODEL_WAS_MADE.md` | the earlier experiment: Cleridae/SPB added to the order classifier | yes |
 | `environment/` | `requirements.txt` + setup notes (timm patch) | yes |
 | `models/` | see below | mappings only |
 | `results/beetle3_model.md` | the beetle model: data, split, results | yes |
-| `results/new_classes_cleridae_spb.md`, `results/slides/` | the earlier 23-class experiment and its demo slides | yes |
+| `results/slides/` | demo slides of the chat identifying beetles | yes |
 | `data/new_classes/` | Cleridae and SPB photos, aligned crops, `split/{train_set,val_set,excluded}` | no |
 | `data/other_coleoptera/` | 2,014 aligned beetle crops of other species + train/val lists | no |
 | `data/beetle3/` | training folder built by the script (links to the two folders above) | no |
-| `runs/` | training runs (`beetle3` = production) and the earlier experiments | no |
+| `runs/` | the production training run (`beetle3`) and the MCP server's overlays | no |
 
 ## Models (`models/`, ~670 MB)
 
@@ -43,7 +42,6 @@ installed in its environment: specimens it classifies as **Coleoptera** (and onl
 | `detector_rtdetr_v3.pt`, `detector_yolo11n.pt` | specimen detectors (RT-DETR default) |
 | `keypoints_cpm_epoch240.pth` | keypoints for pose alignment |
 | `order_classifier_resnet18.pth`, `order_class_mapping.txt` | 21-order classifier: finds the beetles, and the starting point for training |
-| `class_mapping_23cls.txt` | class list of the earlier 23-class experiment |
 
 ## Use
 
